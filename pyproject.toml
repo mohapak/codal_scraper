@@ -10,8 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-  { name = "Mohammad Mehdi Pakravan", email = "pakravanmohammad.eco@gmail.com
-" }
+  { name = "Mohammad Mehdi Pakravan", email = "pakravanmohammad.eco@gmail.com" }
 ]
 keywords = ["codal","tsetmc", "iran", "stock-market", "finance", "scraper", "async", "playwright"]
 classifiers = [
