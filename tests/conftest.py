@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Dict, List
 from unittest.mock import Mock, MagicMock
 
+from codal_scraper.types import BoardMemberData
+
 
 # ============== Sample Data Fixtures ==============
 
