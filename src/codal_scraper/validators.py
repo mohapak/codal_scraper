@@ -453,6 +453,30 @@ def validate_input(
     return validation_methods[validation_type]()
 
 
+def parse_jalali_date(value: str) -> jdate:
+    """
+    Parse a Jalali date string into a ``jdatetime.date``.
+
+    The string is validated first, so a malformed date raises
+    ``ValidationError`` (not a bare ``ValueError``).  Unpadded components are
+    accepted ("1402/5/15"), because ``InputValidator.is_date`` accepts them.
+
+    Args:
+        value: Date string in YYYY/MM/DD format
+
+    Returns:
+        jdatetime.date
+
+    Raises:
+        ValidationError: If the value is not a valid Jalali date
+    """
+    InputValidator(value).is_date()
+
+    year, month, day = (int(part) for part in str(value).split('/'))
+
+    return jdate(year, month, day)
+
+
 def validate_date_range(from_date: str, to_date: str) -> bool:
     """
     Validate a date range.
@@ -467,10 +491,12 @@ def validate_date_range(from_date: str, to_date: str) -> bool:
     Raises:
         ValidationError: If dates are invalid or from_date > to_date
     """
-    InputValidator(from_date).is_date()
-    InputValidator(to_date).is_date()
+    parsed_from = parse_jalali_date(from_date)
+    parsed_to = parse_jalali_date(to_date)
     
-    if from_date > to_date:
+    # Compare the parsed dates: as strings, "1402/5/15" > "1402/10/15" even
+    # though the first date is the earlier one.
+    if parsed_from > parsed_to:
         raise ValidationError(
             f"from_date ({from_date}) must be before or equal to to_date ({to_date})",
             field="date_range"

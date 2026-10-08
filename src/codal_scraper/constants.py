@@ -7,6 +7,7 @@ used throughout the library.
 
 from functools import lru_cache
 from typing import Dict, Tuple
+from jdatetime import date as jd
 from jdatetime import datetime as jdt
 
 
@@ -41,6 +42,32 @@ def get_current_persian_year() -> int:
     return jdt.now().year
 
 
+def get_year_end_date(year: int) -> str:
+    """
+    Last day of a Persian (Jalali) calendar year, in YYYY/MM/DD format.
+
+    A Jalali year ends on 12/29, or on 12/30 when it is a leap year (1403, for
+    instance, is a leap year).  The leap rule comes from ``jdatetime`` rather
+    than from a hand-rolled arithmetic test.
+
+    Args:
+        year: Persian calendar year
+
+    Returns:
+        End date as YYYY/MM/DD
+
+    Example:
+        >>> get_year_end_date(1402)
+        '1402/12/29'
+        >>> get_year_end_date(1403)
+        '1403/12/30'
+    """
+    # jdatetime exposes isleap() on an instance, not as a class method.
+    end_day = 30 if jd(year, 1, 1).isleap() else 29
+
+    return f"{year}/12/{end_day:02d}"
+
+
 def generate_year_ranges(
     start_year: int = 1390, 
     end_year: int = None
@@ -59,12 +86,14 @@ def generate_year_ranges(
         >>> ranges = generate_year_ranges(1402, 1403)
         >>> ranges[1402]
         ('1402/01/01', '1402/12/29')
+        >>> ranges[1403]
+        ('1403/01/01', '1403/12/30')
     """
     if end_year is None:
         end_year = get_current_persian_year()
     
     return {
-        year: (f"{year}/01/01", f"{year}/12/29")
+        year: (f"{year}/01/01", get_year_end_date(year))
         for year in range(start_year, end_year + 1)
     }
 

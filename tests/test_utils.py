@@ -2,12 +2,18 @@
 Tests for utils module
 """
 
+import math
+
 import pytest
 import pandas as pd
 
+from codal_scraper.constants import YEAR_RANGES, generate_year_ranges
 from codal_scraper.utils import (
+    calculate_date_range,
     clean_dict,
     normalize_persian_text,
+    is_independent_duty,
+    year_month_from_date,
     persian_to_english_digits,
     datetime_to_num,
     num_to_datetime,
@@ -29,15 +35,15 @@ class TestCleanDict:
         result = clean_dict({'a': 1, 'b': None, 'c': 3})
         assert result == {'a': 1, 'c': 3}
     
-    def test_removes_minus_one(self):
-        """Test removal of -1 values"""
+    def test_keeps_minus_one_sentinel(self):
+        """-1 is the API "all" sentinel, so it must survive cleaning (P2)"""
         result = clean_dict({'a': 1, 'b': -1, 'c': 3})
-        assert result == {'a': 1, 'c': 3}
+        assert result == {'a': 1, 'b': -1, 'c': 3}
     
     def test_keeps_zero(self):
         """Test that 0 is kept"""
         result = clean_dict({'a': 0, 'b': -1})
-        assert result == {'a': 0}
+        assert result == {'a': 0, 'b': -1}
     
     def test_empty_dict(self):
         """Test with empty dictionary"""
@@ -203,8 +209,6 @@ class TestValueToFloat:
         ("1.5K", 1500.0),
         ("1.5M", 1500000.0),
         ("1B", 1000000000.0),
-        ("invalid", 0.0),
-        ("", 0.0),
     ])
     def test_conversions(self, input_val, expected):
         """Test various value conversions"""
@@ -270,3 +274,93 @@ class TestBuildFullUrl:
     def test_empty_path(self):
         """Test empty path"""
         assert build_full_url("") == ""
+
+# ==================== Regression tests, offline correctness (P0/P1/P2) ====================
+
+class TestDatetimeToNumValidation:
+    """P0-6: a date is validated, so no month/day is ever invented."""
+
+    def test_unpadded_date_is_padded_not_mangled(self):
+        """'1402/5/15' used to produce month 51 (14025115000000)."""
+        assert datetime_to_num("1402/5/15") == 14020515000000
+
+    @pytest.mark.parametrize("bad", [
+        "1402/51/15",          # month 51 - the reported defect
+        "1402/13/01",          # month > 12
+        "1402/00/10",          # month 0
+        "1402/05/32",          # day out of range for any Jalali month
+        "1402/12/30",          # 1402 is not a leap year
+        "not a date",
+        "1402/05/15 25:00:00",
+    ])
+    def test_impossible_values_are_rejected(self, bad):
+        assert datetime_to_num(bad) is None
+
+    def test_leap_year_last_day_is_accepted(self):
+        assert datetime_to_num("1403/12/30") == 14031230000000
+
+
+class TestYearMonthFromDate:
+    """P0-6: the board-scraper year/month split cannot emit month > 12."""
+
+    def test_padded_datetime(self):
+        assert year_month_from_date("1402/05/15 10:30:00") == ("1402", "05")
+
+    def test_unpadded_date(self):
+        assert year_month_from_date("1402/5/15") == ("1402", "05")
+
+    def test_malformed_date_yields_empty_parts(self):
+        assert year_month_from_date("1402/51/15") == ("", "")
+        assert year_month_from_date("1402/13/01") == ("", "")
+        assert year_month_from_date("") == ("", "")
+        assert year_month_from_date(None) == ("", "")
+
+
+class TestLeapYearWindows:
+    """P0-5: a leap Jalali year ends on 12/30, not 12/29."""
+
+    def test_leap_year_range(self):
+        assert calculate_date_range(1403) == ("1403/01/01", "1403/12/30")
+
+    def test_non_leap_year_range(self):
+        assert calculate_date_range(1402) == ("1402/01/01", "1402/12/29")
+
+    def test_generate_year_ranges_handles_both(self):
+        ranges = generate_year_ranges(1402, 1403)
+        assert ranges[1402] == ("1402/01/01", "1402/12/29")
+        assert ranges[1403] == ("1403/01/01", "1403/12/30")
+
+    def test_prebuilt_table_ends_on_the_leap_day(self):
+        assert YEAR_RANGES[1403][1] == "1403/12/30"
+
+
+class TestZwnjHandling:
+    """P0-8: the ZWNJ spelling must not lose the 'غیر موظف' match."""
+
+    def test_zwnj_becomes_a_space(self):
+        assert normalize_persian_text("غیر\u200cموظف") == "غیر موظف"
+
+    def test_other_zero_width_characters_still_removed(self):
+        assert normalize_persian_text("تست\u200fمتن") == "تستمتن"
+
+    @pytest.mark.parametrize("duty", ["غیر موظف", "غیر\u200cموظف"])
+    def test_independent_detected_for_both_spellings(self, duty):
+        assert is_independent_duty(duty) is True
+
+    @pytest.mark.parametrize("duty", ["موظف", "عضو موظف هیئت مدیره", "", None])
+    def test_executive_is_not_independent(self, duty):
+        assert is_independent_duty(duty) is False
+
+
+class TestValueToFloatNaN:
+    """P2: a failed conversion is missing data, not a zero."""
+
+    @pytest.mark.parametrize("bad", ["invalid", "", "   ", "1.5X", None, []])
+    def test_failures_are_nan(self, bad):
+        assert math.isnan(value_to_float(bad))
+
+    def test_zero_still_parses_as_zero(self):
+        assert value_to_float("0") == 0.0
+
+    def test_numeric_strings_still_parse(self):
+        assert value_to_float("1,000") == 1000.0

@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import Mock, patch, MagicMock
 
 from codal_scraper import CodalClient
+from codal_scraper.cache import CacheConfig
 from codal_scraper.exceptions import ValidationError, APIError
 
 
@@ -155,10 +156,16 @@ class TestCodalClientURLGeneration:
 
 class TestCodalClientFetching:
     """Tests for data fetching methods"""
-    
+
     @pytest.fixture
-    def client(self, mock_session, sample_api_response):
-        client = CodalClient()
+    def client(self, mock_session, sample_api_response, tmp_path):
+        # Isolate the on-disk response cache per test. With the default
+        # `.codal_cache`, a response cached by an earlier test in the same
+        # session is served here before the mocked session is ever consulted,
+        # so this class's tests passed or failed depending on test order.
+        client = CodalClient(
+            cache_config=CacheConfig(cache_dir=str(tmp_path / "codal_cache"))
+        )
         client._session = mock_session
         return client
     

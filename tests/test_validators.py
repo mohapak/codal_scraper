@@ -3,8 +3,16 @@ Tests for validators module
 """
 
 import pytest
+from jdatetime import date as jdate
 
-from codal_scraper.validators import InputValidator, validate_input, ValidationError
+from codal_scraper.validators import (
+    InputValidator,
+    parse_jalali_date,
+    validate_date_range,
+    validate_input,
+    ValidationError,
+)
+from codal_scraper.types import DateRange
 
 
 class TestInputValidator:
@@ -190,3 +198,39 @@ class TestValidateInputFunction:
         """Test unknown validation type"""
         with pytest.raises(ValueError):
             validate_input("test", "unknown_type")
+
+# ==================== Regression tests, P1-9 ====================
+
+class TestValidateDateRangeParsesDates:
+    """P1-9: ranges are compared as parsed Jalali dates, not as strings."""
+
+    def test_unpadded_range_is_accepted(self):
+        """'1402/5/15' > '1402/10/15' as strings, but not as dates."""
+        assert validate_date_range("1402/5/15", "1402/10/15") is True
+
+    def test_reversed_unpadded_range_is_rejected(self):
+        with pytest.raises(ValidationError):
+            validate_date_range("1402/10/15", "1402/5/15")
+
+    def test_equal_dates_are_allowed(self):
+        assert validate_date_range("1402/5/15", "1402/5/15") is True
+
+    def test_range_across_a_year_boundary(self):
+        assert validate_date_range("1402/12/29", "1403/01/05") is True
+
+    def test_parse_jalali_date_pads_and_validates(self):
+        assert parse_jalali_date("1402/5/15") == jdate(1402, 5, 15)
+        with pytest.raises(ValidationError):
+            parse_jalali_date("1402/51/15")
+
+
+class TestDateRangeType:
+    """P1-9: DateRange raises ValidationError, not a bare ValueError."""
+
+    def test_reversed_range_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            DateRange("1402/10/15", "1402/5/15")
+
+    def test_valid_unpadded_range_is_kept_verbatim(self):
+        date_range = DateRange("1402/5/15", "1402/10/15")
+        assert date_range.to_dict() == {"FromDate": "1402/5/15", "ToDate": "1402/10/15"}
