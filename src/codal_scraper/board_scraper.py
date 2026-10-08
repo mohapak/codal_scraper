@@ -16,7 +16,7 @@ import networkx as nx
 
 from .utils import (
     clean_dict, normalize_persian_text, persian_to_english_digits,
-    datetime_to_num
+    datetime_to_num, year_month_from_date, is_independent_duty
 )
 from .constants import BOARD_MEMBER_SELECTORS
 from .types import BoardMemberData, ScrapingErrorInfo, ScrapingErrorType
@@ -254,10 +254,15 @@ class BoardMemberScraper:
             month = ""
             year = ""
             if date:
-                date_num = str(datetime_to_num(date))[:8] if datetime_to_num(date) else ""
-                if date_num:
-                    year = date_num[:4]
-                    month = date_num[4:6]
+                date_value = datetime_to_num(date)
+                if date_value is not None:
+                    date_num = str(date_value)[:8]
+                    year, month = year_month_from_date(date)
+                else:
+                    logger.warning(
+                        f"Unparseable session date {date!r} at {url}; "
+                        "leaving date/year/month empty"
+                    )
             
             # Normalize company symbol
             company_symbol = normalize_persian_text(company_symbol) if company_symbol else "Unknown"
@@ -369,7 +374,7 @@ class BoardMemberScraper:
                         'position': self._get_text_value(info, idx_position),
 
                         # "غیر موظف" -> non-executive / independent
-                        'is_independent': 'غیر موظف' in duty_text if duty_text else False,
+                        'is_independent': is_independent_duty(duty_text),
 
                         'degree': self._get_text_value(info, idx_degree),
                         'major': self._get_text_value(info, idx_major),

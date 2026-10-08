@@ -1,8 +1,49 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from codal_scraper.processor import DataProcessor
+
+
+LETTERS = [
+    {
+        "Url": "/Reports/Decision.aspx?LetterSerial=123456",
+        "TracingNo": "123456",
+        "Symbol": "فولاد",
+        "CompanyName": "فولاد مبارکه اصفهان",
+        "Title": "معرفی/تغییر در ترکیب اعضای هیئت مدیره",
+        "LetterCode": "ن-45",
+        "PublishDateTime": "1402/03/05 10:30:00",
+        "HasExcel": True,
+    },
+    {
+        "Url": "/Reports/Decision.aspx?LetterSerial=123457",
+        "TracingNo": "123457",
+        "Symbol": "فولاد",
+        "CompanyName": "فولاد مبارکه اصفهان",
+        "Title": "صورت های مالی میان دوره ای",
+        "LetterCode": "ن-10",
+        "PublishDateTime": "1402/02/20 09:00:00",
+        "HasExcel": False,
+    },
+    {
+        "Url": "/Reports/Decision.aspx?LetterSerial=123458",
+        "TracingNo": "123458",
+        "Symbol": "خودرو",
+        "CompanyName": "ایران خودرو",
+        "Title": "گزارش فعالیت ماهانه",
+        "LetterCode": "ن-10",
+        "PublishDateTime": "1402/01/10 08:00:00",
+        "HasExcel": False,
+    },
+]
+
+
+@pytest.fixture
+def processor():
+    """A DataProcessor over three Codal letters (two symbols, one ن-45)."""
+    return DataProcessor(LETTERS)
 
 
 def test_to_dataframe_normalizes_columns(processor):

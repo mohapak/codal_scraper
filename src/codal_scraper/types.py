@@ -197,13 +197,19 @@ class DateRange:
     
     def __post_init__(self):
         """Validate dates on creation"""
-        from .validators import InputValidator
-        InputValidator(self.from_date).is_date()
-        InputValidator(self.to_date).is_date()
+        from .validators import parse_jalali_date
+        from .exceptions import ValidationError
         
-        # Ensure from_date <= to_date
-        if self.from_date > self.to_date:
-            raise ValueError(f"from_date ({self.from_date}) must be <= to_date ({self.to_date})")
+        # Compare parsed Jalali dates, not strings: "1402/5/15" sorts after
+        # "1402/10/15" as a string even though it is the earlier date.
+        parsed_from = parse_jalali_date(self.from_date)
+        parsed_to = parse_jalali_date(self.to_date)
+        
+        if parsed_from > parsed_to:
+            raise ValidationError(
+                f"from_date ({self.from_date}) must be <= to_date ({self.to_date})",
+                field="date_range",
+            )
     
     def to_dict(self) -> Dict[str, str]:
         """Convert to dictionary for API params"""

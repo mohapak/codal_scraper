@@ -25,7 +25,7 @@ from .constants import (
     DEFAULT_RETRY_COUNT
 )
 from .utils import clean_dict, clean_symbol, build_full_url
-from .validators import InputValidator
+from .validators import InputValidator, validate_date_range
 from .exceptions import APIError, RateLimitError, ValidationError, NetworkError, ParseError
 from .cache import FileCache, CacheConfig
 from .rate_limiter import RateLimiter, RateLimitConfig
@@ -349,6 +349,12 @@ class CodalClient:
         if to_date:
             InputValidator(to_date).is_date()
             self.params["ToDate"] = to_date
+        
+        if from_date and to_date:
+            # Ordering is checked on parsed Jalali dates (validators.py): a raw
+            # string comparison rejects valid ranges such as 1402/5/15 ->
+            # 1402/10/15.
+            validate_date_range(from_date, to_date)
         else:
             self.params["ToDate"] = -1
         

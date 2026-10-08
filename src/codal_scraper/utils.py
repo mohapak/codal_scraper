@@ -7,13 +7,18 @@ data cleaning, and other common operations.
 
 import re
 import logging
-from typing import Any, Dict, Iterator, List, Optional, Sized, Union
+from typing import Any, Dict, Iterator, List, Optional, Sized, Tuple, Union
 
 import pandas as pd
 from jdatetime import date as jd
 from jdatetime import datetime as jdt
 
-from .constants import FA_TO_EN_DIGITS, AR_TO_EN_DIGITS, AR_TO_FA_LETTER
+from .constants import (
+    FA_TO_EN_DIGITS,
+    AR_TO_EN_DIGITS,
+    AR_TO_FA_LETTER,
+    get_year_end_date,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -23,7 +28,12 @@ logger = logging.getLogger(__name__)
 
 def clean_dict(dictionary: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Remove None and -1 values from dictionary.
+    Remove None values from dictionary.
+
+    ``-1`` is a meaningful sentinel in the Codal query API ("all" - see
+    ``constants.COMPANY_TYPES``), so only ``None`` is dropped.  The identity
+    test also avoids the ambiguous ``ValueError`` that ``v not in [...]``
+    raises for numpy arrays.
     
     Args:
         dictionary: Input dictionary to clean
@@ -33,9 +43,9 @@ def clean_dict(dictionary: Dict[str, Any]) -> Dict[str, Any]:
         
     Example:
         >>> clean_dict({'a': 1, 'b': -1, 'c': None})
-        {'a': 1}
+        {'a': 1, 'b': -1}
     """
-    return {k: v for k, v in dictionary.items() if v not in [None, -1, "-1"]}
+    return {k: v for k, v in dictionary.items() if v is not None}
 
 
 def safe_get(dictionary: Dict, *keys, default: Any = None) -> Any:
@@ -91,7 +101,9 @@ def normalize_persian_text(text: str) -> str:
     
     This function:
     - Converts Arabic characters to Persian equivalents
-    - Removes zero-width characters
+    - Turns the zero-width non-joiner (U+200C) into a space, so ZWNJ and
+      plain-space spellings normalise identically
+    - Removes the remaining zero-width / bidi-control characters
     - Normalizes whitespace
     
     Args:
@@ -113,9 +125,11 @@ def normalize_persian_text(text: str) -> str:
     for ar, fa in AR_TO_FA_LETTER.items():
         text = text.replace(ar, fa)
     
-    # Remove zero-width characters
-    zero_width_chars = ['\u200c', '\u200f', '\u200e', '\u200d', '\u200b', '\ufeff']
-    for char in zero_width_chars:
+    # ZWNJ is a word separator in Persian, not noise: replacing it with a
+    # space keeps "غیر\u200cموظف" equal to "غیر موظف".  The other zero-width
+    # and bidi-control characters carry no meaning, so they are dropped.
+    text = text.replace('\u200c', ' ')
+    for char in ['\u200f', '\u200e', '\u200d', '\u200b', '\ufeff']:
         text = text.replace(char, '')
     
     # Normalize whitespace
@@ -216,44 +230,157 @@ def clean_symbol(symbol: str) -> str:
     )
 
 
+def is_independent_duty(duty_text: str) -> bool:
+    """
+    True when a board-member duty cell marks the member as non-executive
+    ("غیر موظف").
+
+    Codal may render the duty with a plain space or with a ZWNJ, so the text is
+    normalised first (ZWNJ -> space, spaces then removed for the comparison),
+    which makes both spellings match.  The "غیر" negation is part of the matched
+    token, so a plain "موظف" (executive) is not classified as independent.
+
+    Args:
+        duty_text: Raw duty cell text
+
+    Returns:
+        True if the member is non-executive / independent
+
+    Example:
+        >>> is_independent_duty("غیر موظف")
+        True
+        >>> is_independent_duty("غير‌موظف")
+        True
+        >>> is_independent_duty("موظف")
+        False
+    """
+    if not duty_text:
+        return False
+
+    compact = normalize_persian_text(str(duty_text)).replace(' ', '')
+
+    return 'غیرموظف' in compact
+
+
 # ============== Date Utilities ==============
+
+# Accepted Jalali input shapes.  Each component is captured separately so it
+# can be validated before a timestamp is assembled - no field is ever invented.
+_JALALI_DATETIME_RE = re.compile(
+    r'^\s*(?P<year>\d{4})[/\-\.](?P<month>\d{1,2})[/\-\.](?P<day>\d{1,2})'
+    r'(?:[ T]+(?P<hour>\d{1,2}):(?P<minute>\d{1,2})(?::(?P<second>\d{1,2}))?)?\s*$'
+)
+_JALALI_COMPACT_DATETIME_RE = re.compile(
+    r'^(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})'
+    r'(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})$'
+)
+_JALALI_COMPACT_DATE_RE = re.compile(
+    r'^(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})$'
+)
+
 
 def datetime_to_num(dt: Union[str, None]) -> Optional[int]:
     """
-    Convert datetime string to numeric format (YYYYMMDDHHmmss).
-    
+    Convert a Jalali datetime string to numeric format (YYYYMMDDHHmmss).
+
+    The string is parsed field by field and validated against the Persian
+    calendar before the timestamp is assembled, so a component is never
+    invented: an unparseable or impossible date (e.g. ``"1402/51/15"``, which
+    used to return the month-51 value ``14025115000000``) returns ``None``.
+
+    Unpadded components are accepted and zero-padded (``"1402/5/15"`` ->
+    ``14020515000000``), matching ``InputValidator.is_date``, which accepts the
+    unpadded form too.
+
     Args:
-        dt: Datetime string to convert
-        
+        dt: Datetime string - ``YYYY/MM/DD[ HH:MM[:SS]]``, ``YYYYMMDD`` or
+            ``YYYYMMDDHHmmss``
+
     Returns:
         Integer representation or None if conversion fails
-        
+
     Example:
         >>> datetime_to_num("1402/05/15 10:30:00")
         14020515103000
+        >>> datetime_to_num("1402/5/15")
+        14020515000000
+        >>> datetime_to_num("1402/51/15") is None
+        True
     """
     if not dt or dt == "":
         return None
-    
-    try:
-        # Remove non-numeric characters
-        dt_clean = re.sub(r'[^0-9]', '', str(dt))
-        
-        if not dt_clean:
-            return None
-        
-        # Pad with zeros to get 14 digits (YYYYMMDDHHmmss)
-        dt_len = len(dt_clean)
-        if dt_len > 14:
-            dt_clean = dt_clean[:14]
-        elif dt_len < 14:
-            dt_clean = dt_clean.ljust(14, '0')
-        
-        return int(dt_clean)
-        
-    except (ValueError, TypeError) as e:
-        logger.warning(f"Error converting datetime '{dt}': {e}")
+
+    text = str(dt).strip()
+
+    match = None
+    for pattern in (
+        _JALALI_DATETIME_RE,
+        _JALALI_COMPACT_DATETIME_RE,
+        _JALALI_COMPACT_DATE_RE,
+    ):
+        match = pattern.match(text)
+        if match:
+            break
+
+    if not match:
+        logger.warning(f"Unparseable Jalali datetime {dt!r}: returning None")
         return None
+
+    parts = match.groupdict()
+    year = int(parts['year'])
+    month = int(parts['month'])
+    day = int(parts['day'])
+
+    # Calendar validation - this is what stops month 51 / day 32 from ever
+    # becoming part of a dataset value.
+    try:
+        jd(year, month, day)
+    except ValueError as e:
+        logger.warning(f"Invalid Jalali date {dt!r}: {e}")
+        return None
+
+    hour = int(parts.get('hour') or 0)
+    minute = int(parts.get('minute') or 0)
+    second = int(parts.get('second') or 0)
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        logger.warning(f"Invalid time component in Jalali datetime {dt!r}: returning None")
+        return None
+
+    return int(f"{year:04d}{month:02d}{day:02d}{hour:02d}{minute:02d}{second:02d}")
+
+
+def year_month_from_date(dt: Union[str, None]) -> Tuple[str, str]:
+    """
+    Derive the (year, month) of a Jalali date/time string, zero-padded.
+
+    Returns ``("", "")`` when the value cannot be parsed or is not a real
+    Jalali date, so a malformed cell can never contribute an invented year or
+    month (the ``"1402/5/15" -> month 51`` class of bug) to a dataset row.
+
+    Args:
+        dt: Datetime string
+
+    Returns:
+        Tuple of (year, month) as zero-padded strings, or ("", "")
+
+    Example:
+        >>> year_month_from_date("1402/5/15")
+        ('1402', '05')
+        >>> year_month_from_date("1402/51/15")
+        ('', '')
+    """
+    num = datetime_to_num(dt)
+    if num is None:
+        return "", ""
+
+    digits = f"{num:014d}"
+    year, month = digits[:4], digits[4:6]
+
+    if not (1 <= int(month) <= 12):
+        return "", ""
+
+    return year, month
 
 
 def num_to_datetime(
@@ -357,9 +484,11 @@ def calculate_date_range(year: int) -> tuple:
     Example:
         >>> calculate_date_range(1402)
         ('1402/01/01', '1402/12/29')
+        >>> calculate_date_range(1403)
+        ('1403/01/01', '1403/12/30')
     """
     start_date = f"{year}/01/01"
-    end_date = f"{year}/12/29"
+    end_date = get_year_end_date(year)
     
     return start_date, end_date
 
@@ -393,23 +522,27 @@ def value_to_float(value: Union[str, int, float]) -> float:
         value: Value to convert
         
     Returns:
-        Float value
+        Float value, or ``float("nan")`` when the value cannot be parsed.
+        Returning NaN (rather than 0.0) keeps a missing or malformed figure
+        distinct from a genuine zero in the resulting dataset.
         
     Example:
         >>> value_to_float("1.5M")
         1500000.0
+        >>> value_to_float("invalid")
+        nan
     """
     if isinstance(value, (int, float)):
         return float(value)
     
     if not isinstance(value, str):
-        return 0.0
+        return float("nan")
     
     # Remove commas and whitespace
     value = value.replace(',', '').replace(' ', '').strip()
     
     if not value:
-        return 0.0
+        return float("nan")
     
     # Handle suffixes
     multipliers = {
@@ -429,12 +562,12 @@ def value_to_float(value: Union[str, int, float]) -> float:
                 number = float(value[:-1].strip())
                 return number * multiplier
             except ValueError:
-                return 0.0
+                return float("nan")
     
     try:
         return float(value)
     except ValueError:
-        return 0.0
+        return float("nan")
 
 
 def format_number(number: Union[int, float], decimal_places: int = 0) -> str:
