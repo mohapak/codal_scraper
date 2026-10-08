@@ -67,7 +67,7 @@ def test_filter_by_date_range(processor):
 def test_select_and_sort(processor):
     df = (
         processor.select_columns(["Symbol", "PublishDateTime"])
-        .sort_values("publish_date_time", ascending=False)
+        .sort_by("publish_date_time", ascending=False)
         .to_dataframe()
     )
     assert list(df.columns) == ["symbol", "publish_date_time"]
@@ -75,6 +75,13 @@ def test_select_and_sort(processor):
 
 
 def test_summary(processor):
+    # KNOWN TEST DEFECT - left failing deliberately, not skipped or xfailed.
+    # DataProcessor has no `summary()`; the real API is get_summary_stats(),
+    # which returns 'total_records' (not 'rows') and 'letter_code_distribution'
+    # (not 'letter_code_breakdown'). Rewriting the assertions would be choosing
+    # between two plausible intents - correcting the test, or adding a
+    # `summary()`/key-naming contract to the library - so the call is left for
+    # the owner. See the PR body.
     summary = processor.summary()
     assert summary["rows"] == 3
     assert summary["unique_symbols"] == 2
@@ -82,13 +89,19 @@ def test_summary(processor):
 
 
 def test_groupby(processor):
-    grouped = processor.groupby("symbol", {"tracing_no": "count"})
+    grouped = processor.group_by("symbol", {"tracing_no": "count"})
     assert isinstance(grouped, pd.DataFrame)
     assert grouped[grouped["symbol"] == "فولاد"]["tracing_no"].iloc[0] == 2
 
 
 def test_export_to_csv(tmp_path, processor):
-    out = processor.to_csv(tmp_path / "letters.csv")
-    assert Path(out).exists()
-    content = Path(out).read_text(encoding="utf-8")
-    assert "Board change" in content
+    # to_csv() returns self for chaining; the path is the argument, not the
+    # return value. The exported column values are the Persian strings Codal
+    # returns (titles such as "معرفی/تغییر در ترکیب اعضای هیئت مدیره"); the
+    # library never writes the English label "Board change".
+    out = tmp_path / "letters.csv"
+    processor.to_csv(out)
+    assert out.exists()
+    content = out.read_text(encoding="utf-8-sig")
+    assert "فولاد" in content
+    assert "معرفی/تغییر در ترکیب اعضای هیئت مدیره" in content
