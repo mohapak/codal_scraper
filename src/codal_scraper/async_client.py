@@ -24,6 +24,11 @@ from .exceptions import APIError, RateLimitError, NetworkError
 from .cache import FileCache, CacheConfig
 from .rate_limiter import AsyncRateLimiter
 from .types import LetterData, QueryParams, QueryStats
+from .pagination import (
+    MAX_PAGES_ABSOLUTE, PaginationCapExceededError, assert_within_cap,
+    detect_page_semantics,
+    estimate_page_count, finalize_harvest, new_result, page_cap, response_total
+)
 
 
 logger = logging.getLogger(__name__)
@@ -216,71 +221,147 @@ class AsyncCodalClient:
             return None
     
     async def fetch_all_pages(
-        self, 
+        self,
         params: Dict,
         max_pages: Optional[int] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        allow_partial: bool = False
     ) -> List[LetterData]:
         """
-        Fetch all pages concurrently.
-        
+        Fetch every page of a query, whichever way the API's `Page` field
+        behaves.
+
+        Behaviourally identical to `CodalClient.fetch_all_pages`: the page count
+        comes from `Total` and the page size actually returned, never from the
+        response's `Page` field (P0-3); paging stops at `Total` items or at the
+        first empty page; and the harvest is asserted against `Total`.
+
         Args:
             params: Query parameters
-            max_pages: Maximum pages to fetch (None = all)
+            max_pages: Hard bound on pages fetched (also caps the sanity limit)
             use_cache: Whether to use cache
-            
+            allow_partial: Return what arrived when it falls short of `Total`,
+                instead of raising. The returned list still records
+                `expected_total`, `arrived`, `shortfall` and `provenance()`.
+
         Returns:
-            Combined list of all letters
+            Combined list of all letters/announcements, as a
+            `pagination.PaginationResult` (a plain list carrying provenance).
+
+        Raises:
+            PaginationCapExceededError: the response implies more pages than the
+                cap allows (e.g. a runaway `Total`).
+            IncompleteResultsError: fewer items arrived than `Total` claimed and
+                `allow_partial` is False.
         """
         start_time = time.time()
-        
-        # First, get total pages from first request
         first_url = self._build_url(params, page=1)
         first_response = await self._fetch_page(first_url, use_cache)
-        
         if not first_response:
+            logger.warning("Failed to fetch first page")
             return []
-        
-        total_pages = first_response.get("Page", 0)
-        total_results = first_response.get("Total", 0)
-        all_letters: List[LetterData] = first_response.get("Letters", [])
-        
-        if max_pages:
-            total_pages = min(total_pages, max_pages)
-        
-        logger.info(f"Total results: {total_results}, pages: {total_pages}")
-        
-        if total_pages <= 1:
-            self._stats['total_items'] = len(all_letters)
-            return all_letters
-        
-        # Fetch remaining pages concurrently
-        tasks = [
-            self._fetch_page(self._build_url(params, page=p), use_cache)
-            for p in range(2, total_pages + 1)
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for i, result in enumerate(results, start=2):
-            if isinstance(result, dict) and 'Letters' in result:
-                all_letters.extend(result['Letters'])
-            elif isinstance(result, Exception):
-                logger.error(f"Page {i} failed: {result}")
-            else:
-                logger.warning(f"Page {i} returned no data")
-        
+
+        first_letters = list(first_response.get("Letters") or [])
+        total = response_total(first_response)
+        page_size = len(first_letters)
+        pages_needed = estimate_page_count(total, page_size)
+        if total is None:
+            cap = int(max_pages) if max_pages else MAX_PAGES_ABSOLUTE
+        else:
+            cap = page_cap(pages_needed, max_pages)
+        page_field_mode = detect_page_semantics(first_response, 1, pages_needed)
+        logger.info(
+            f"Total: {total} item(s), page size {page_size}, "
+            f"~{pages_needed} page(s) expected (cap {cap}); response 'Page' "
+            f"field reads as {page_field_mode}"
+        )
+        # Two guards: an absolute one that always raises (a nonsensical `Total`
+        # must never become a crawl), and the caller's own `max_pages`, which
+        # `allow_partial` may turn into a graceful truncation.
+        ceiling = (
+            max(MAX_PAGES_ABSOLUTE, int(max_pages)) if max_pages
+            else MAX_PAGES_ABSOLUTE
+        )
+        assert_within_cap(pages_needed, ceiling, total=total, page_size=page_size)
+        if pages_needed > cap and not allow_partial:
+            raise PaginationCapExceededError(
+                f"max_pages={max_pages} allows {cap} page(s) but the response "
+                f"implies {pages_needed} page(s) for Total={total}; pass a larger "
+                f"max_pages, or allow_partial=True to accept a partial harvest.",
+                expected=pages_needed,
+                collected=0,
+                details={
+                    "total": total, "page_size": page_size,
+                    "page_cap": cap, "max_pages": max_pages,
+                }
+            )
+
+        collected = new_result(
+            first_response, first_letters,
+            page_cap_value=cap, page_field_mode=page_field_mode
+        )
+        failed_pages = 0
+
+        async def fetch(page_number: int) -> Optional[Dict[str, Any]]:
+            return await self._fetch_page(
+                self._build_url(params, page=page_number), use_cache
+            )
+
+        # Pages 2..estimate are fetched concurrently; the client's semaphore and
+        # rate limiter bound how hard this hits codal.ir. Pages beyond the
+        # estimate are fetched one at a time, so a wrong estimate costs a single
+        # extra request rather than another fan-out.
+        estimated_last = min(pages_needed, cap)
+        if estimated_last >= 2:
+            pages = list(range(2, estimated_last + 1))
+            collected.pages_requested += len(pages)
+            results = await asyncio.gather(
+                *(fetch(p) for p in pages), return_exceptions=True
+            )
+            for p, result in zip(pages, results):
+                if isinstance(result, BaseException) or not isinstance(result, dict):
+                    failed_pages += 1
+                    logger.error(f"Page {p} failed: {result}")
+                    continue
+                letters = list(result.get("Letters") or [])
+                if not letters:
+                    logger.info(f"Page {p} returned zero items")
+                    continue
+                collected.extend(letters)
+                collected.pages_fetched += 1
+
+        page = max(2, estimated_last + 1)
+        while page <= cap:
+            if total is not None:
+                if len(collected) >= total:
+                    break
+            elif not page_size:
+                break  # no `Total` and an empty first page: nothing to page
+            collected.pages_requested += 1
+            result = await fetch(page)
+            if not isinstance(result, dict):
+                failed_pages += 1
+                logger.warning(f"Failed to fetch page {page}")
+                page += 1
+                continue
+            letters = list(result.get("Letters") or [])
+            if not letters:
+                logger.info(f"Page {page} returned zero items; stopping")
+                break
+            collected.extend(letters)
+            collected.pages_fetched += 1
+            page += 1
+
+        collected.failed_pages = failed_pages
         elapsed = time.time() - start_time
         self._stats['total_time'] = elapsed
-        self._stats['total_items'] = len(all_letters)
-        
+        self._stats['total_items'] = len(collected)
         logger.info(
-            f"Fetched {len(all_letters)} items from {total_pages} pages "
-            f"in {elapsed:.2f}s ({len(all_letters)/elapsed:.1f} items/sec)"
+            f"Fetched {len(collected)} item(s) from {collected.pages_fetched} "
+            f"page(s) in {elapsed:.2f}s"
         )
-        
-        return all_letters
-    
+        return finalize_harvest(collected, allow_partial=allow_partial)
+
     # ============== Convenience Methods ==============
     
     async def fetch_board_changes(

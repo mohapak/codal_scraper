@@ -30,6 +30,11 @@ from .exceptions import APIError, RateLimitError, ValidationError, NetworkError,
 from .cache import FileCache, CacheConfig
 from .rate_limiter import RateLimiter, RateLimitConfig
 from .types import QueryParams, LetterData, QueryStats, PaginationInfo
+from .pagination import (
+    MAX_PAGES_ABSOLUTE, PaginationCapExceededError, assert_within_cap,
+    detect_page_semantics,
+    estimate_page_count, finalize_harvest, new_result, page_cap, response_total
+)
 
 
 logger = logging.getLogger(__name__)
@@ -449,19 +454,33 @@ class CodalClient:
     
     def set_page_number(self, page: int) -> 'CodalClient':
         """
-        Set page number for pagination.
-        
+        Set the page number for the next query.
+
         Args:
             page: Page number (1-based)
-        
+
         Returns:
             Self for method chaining
+
+        Raises:
+            ValidationError: if `page` is not a positive integer. An invalid
+                page used to be ignored silently, which left whatever page
+                happened to be current in place (so `fetch_page(0)` quietly
+                re-fetched the previous page).
         """
-        if page and page > 0:
-            self.params["PageNumber"] = page
-            self.current_page = page
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise ValidationError(
+                "Page number must be an integer", field="page", value=page
+            )
+        if page < 1:
+            raise ValidationError(
+                "Page number must be >= 1 (pages are 1-based)",
+                field="page", value=page
+            )
+        self.params["PageNumber"] = page
+        self.current_page = page
         return self
-    
+
     # ============== URL Generation ==============
     
     def get_query_url(self, use_api: bool = True) -> str:
@@ -595,101 +614,191 @@ class CodalClient:
         
         return None
     
+    def _fetch_page_response(
+        self,
+        page: Optional[int] = None,
+        use_cache: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch one raw API response page and refresh pagination metadata.
+
+        Args:
+            page: 1-based page number to fetch (None = the page currently set)
+            use_cache: Whether to use cache
+
+        Returns:
+            The parsed response dict (with its `Total`, `Page` and `Letters`),
+            or None if the request failed.
+        """
+        if page is None:
+            page = self.params.get("PageNumber") or 1
+        self.set_page_number(page)
+        url = self.get_query_url(use_api=True)
+        logger.info(f"Fetching page {self.params['PageNumber']}")
+        response = self._make_request(url, use_cache=use_cache)
+        if not response:
+            return None
+
+        letters = response.get("Letters") or []
+        self.total_results = response_total(response) or 0
+        # P0-3: never derive the page count from the response's `Page` field.
+        # It may be the *current page index*, in which case page 1 reports a
+        # page count of 1 and every query looks like it fits on one page.
+        # Estimate from `Total` and the page size actually returned instead,
+        # and never let the estimate shrink as we page forward.
+        estimated_pages = estimate_page_count(self.total_results, len(letters))
+        if self.total_pages is None or estimated_pages > self.total_pages:
+            self.total_pages = estimated_pages
+        self.current_page = self.params["PageNumber"]
+        self._stats['total_items_fetched'] += len(letters)
+        return response
+
     def fetch_page(
-        self, 
+        self,
         page: Optional[int] = None,
         use_cache: bool = True
     ) -> Optional[List[LetterData]]:
         """
         Fetch a single page of results.
-        
+
         Args:
-            page: Page number to fetch (if None, uses current page)
+            page: 1-based page number to fetch (None = the page currently set)
             use_cache: Whether to use cache
-        
+
         Returns:
             List of letters/announcements or None if failed
+
+        Raises:
+            ValidationError: if `page` is not a positive integer.
         """
-        if page:
-            self.set_page_number(page)
-        
-        url = self.get_query_url(use_api=True)
-        logger.info(f"Fetching page {self.params['PageNumber']}")
-        
-        response = self._make_request(url, use_cache=use_cache)
-        
+        response = self._fetch_page_response(page, use_cache=use_cache)
         if not response:
             return None
-        
-        # Update metadata
-        self.total_results = response.get("Total", 0)
-        self.total_pages = response.get("Page", 0)
-        
-        letters = response.get("Letters", [])
-        self._stats['total_items_fetched'] += len(letters)
-        
-        return letters
-    
+        return response.get("Letters") or []
+
     def fetch_all_pages(
-        self, 
+        self,
         max_pages: Optional[int] = None,
         use_cache: bool = True,
-        show_progress: bool = True
+        show_progress: bool = True,
+        allow_partial: bool = False
     ) -> List[LetterData]:
         """
-        Fetch multiple pages of results.
-        
+        Fetch every page of the current query, whichever way the API's `Page`
+        field behaves.
+
+        The number of pages is derived from the response's `Total` and the page
+        size the API *actually returned* -- never from its `Page` field, which
+        may be either the current page index or the page count (P0-3). Paging
+        stops once `Total` items have been collected or a page returns zero
+        items, and the harvest is asserted against `Total` before it is
+        returned, so a shortfall cannot pass silently.
+
         Args:
-            max_pages: Maximum number of pages to fetch (None = fetch all)
+            max_pages: Hard bound on pages fetched. It also caps the sanity
+                limit, so a query that genuinely needs more pages than this
+                raises instead of quietly returning less than `Total`.
             use_cache: Whether to use cache
-            show_progress: Whether to show progress information
-        
+            show_progress: Whether to log per-page progress
+            allow_partial: Return what arrived when it falls short of `Total`,
+                instead of raising. The returned list still records
+                `expected_total`, `arrived`, `shortfall` and `provenance()`.
+
         Returns:
-            Combined list of all letters/announcements
+            Combined list of all letters/announcements. It is a plain list, but
+            a `pagination.PaginationResult` one, carrying provenance.
+
+        Raises:
+            PaginationCapExceededError: the response implies more pages than the
+                cap allows (e.g. a runaway `Total`).
+            IncompleteResultsError: fewer items arrived than `Total` claimed and
+                `allow_partial` is False.
         """
         start_time = time.time()
-        
-        # First, fetch the initial page to get metadata
-        first_page_data = self.fetch_page(1, use_cache=use_cache)
-        
-        if not first_page_data:
+        first_response = self._fetch_page_response(1, use_cache=use_cache)
+        if not first_response:
             logger.warning("Failed to fetch first page")
             return []
-        
-        all_letters: List[LetterData] = list(first_page_data)
-        
-        # Determine how many pages to fetch
-        pages_to_fetch = self.total_pages or 1
-        if max_pages:
-            pages_to_fetch = min(pages_to_fetch, max_pages)
-        
-        if pages_to_fetch <= 1:
-            return all_letters
-        
-        logger.info(f"Fetching {pages_to_fetch - 1} additional pages (total: {pages_to_fetch})")
-        
+
+        first_letters = list(first_response.get("Letters") or [])
+        total = self.total_results or None
+        page_size = len(first_letters)
+        pages_needed = estimate_page_count(total, page_size)
+        if total is None:
+            # No usable `Total` to aim at: page until a page comes back empty,
+            # bounded only by the absolute cap (or the caller's own bound).
+            cap = int(max_pages) if max_pages else MAX_PAGES_ABSOLUTE
+        else:
+            cap = page_cap(pages_needed, max_pages)
+        page_field_mode = detect_page_semantics(first_response, 1, pages_needed)
+        logger.info(
+            f"Total: {total} item(s), page size {page_size}, "
+            f"~{pages_needed} page(s) expected (cap {cap}); response 'Page' "
+            f"field reads as {page_field_mode}"
+        )
+        # Two guards: an absolute one that always raises (a nonsensical `Total`
+        # must never become a crawl), and the caller's own `max_pages`, which
+        # `allow_partial` may turn into a graceful truncation.
+        ceiling = (
+            max(MAX_PAGES_ABSOLUTE, int(max_pages)) if max_pages
+            else MAX_PAGES_ABSOLUTE
+        )
+        assert_within_cap(pages_needed, ceiling, total=total, page_size=page_size)
+        if pages_needed > cap and not allow_partial:
+            raise PaginationCapExceededError(
+                f"max_pages={max_pages} allows {cap} page(s) but the response "
+                f"implies {pages_needed} page(s) for Total={total}; pass a larger "
+                f"max_pages, or allow_partial=True to accept a partial harvest.",
+                expected=pages_needed,
+                collected=0,
+                details={
+                    "total": total, "page_size": page_size,
+                    "page_cap": cap, "max_pages": max_pages,
+                }
+            )
+
+        collected = new_result(
+            first_response, first_letters,
+            page_cap_value=cap, page_field_mode=page_field_mode
+        )
         failed_pages = 0
-        
-        # Fetch remaining pages
-        for page in range(2, pages_to_fetch + 1):
-            page_data = self.fetch_page(page, use_cache=use_cache)
-            
-            if page_data:
-                all_letters.extend(page_data)
-                if show_progress:
-                    logger.info(f"Fetched page {page}/{pages_to_fetch} ({len(page_data)} items)")
-            else:
+        page = 2
+        while page <= cap:
+            if total is not None:
+                if len(collected) >= total:
+                    break
+            elif not page_size:
+                break  # no `Total` and an empty first page: nothing to page
+            collected.pages_requested += 1
+            response = self._fetch_page_response(page, use_cache=use_cache)
+            if not response:
                 failed_pages += 1
                 logger.warning(f"Failed to fetch page {page}")
-        
+                page += 1
+                continue
+            letters = list(response.get("Letters") or [])
+            if not letters:
+                logger.info(f"Page {page} returned zero items; stopping")
+                break
+            collected.extend(letters)
+            collected.pages_fetched += 1
+            if show_progress:
+                logger.info(
+                    f"Fetched page {page}/{cap} ({len(letters)} items, "
+                    f"{len(collected)} collected)"
+                )
+            page += 1
+
+        collected.failed_pages = failed_pages
         elapsed = time.time() - start_time
         logger.info(
-            f"Fetched {len(all_letters)} items from {pages_to_fetch - failed_pages} pages "
-            f"in {elapsed:.2f}s"
+            f"Fetched {len(collected)} item(s) from {collected.pages_fetched} "
+            f"page(s) in {elapsed:.2f}s"
         )
-        
-        return all_letters
-    
+        return finalize_harvest(
+            collected, allow_partial=allow_partial, query=self.get_query_url()
+        )
+
     def fetch_tsetmc_data(
         self, 
         data_type: str, 

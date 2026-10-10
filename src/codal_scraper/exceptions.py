@@ -143,3 +143,40 @@ class ParseError(CodalScraperError):
             details["content_type"] = content_type
         super().__init__(message, details)
         self.content_type = content_type
+
+class PaginationError(CodalScraperError):
+    """
+    Raised when pagination cannot be completed consistently with the API's own
+    metadata (see P0-3: the response's ``Page`` field is ambiguous).
+
+    Carries the numbers needed to judge the damage: ``expected`` (what the API
+    said existed) and ``collected`` (what actually arrived).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        expected: Optional[int] = None,
+        collected: Optional[int] = None,
+        pages_fetched: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None
+    ):
+        details = dict(details or {})
+        if expected is not None:
+            details["expected"] = expected
+        if collected is not None:
+            details["collected"] = collected
+        if pages_fetched is not None:
+            details["pages_fetched"] = pages_fetched
+        super().__init__(message, details)
+        self.expected = expected
+        self.collected = collected
+        self.pages_fetched = pages_fetched
+
+
+class IncompleteResultsError(PaginationError):
+    """Fewer items arrived than the API's ``Total`` claimed."""
+
+
+class PaginationCapExceededError(PaginationError):
+    """A page cap was hit before the reported items could be collected."""
