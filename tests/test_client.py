@@ -176,7 +176,14 @@ class TestCodalClientFetching:
         assert letters is not None
         assert len(letters) == len(sample_api_response['Letters'])
         assert client.total_results == sample_api_response['Total']
-        assert client.total_pages == sample_api_response['Page']
+        # P0-3: total_pages must NOT be read from the response's `Page`
+        # field: `Page` may be the current page index, in which case page 1
+        # reports a page count of 1 and every query silently looks like a
+        # single page. It is derived from `Total` and the page size the API
+        # actually returned instead (ceil(100 / 3) == 34 here, not Page=10).
+        assert client.total_pages == -(-sample_api_response['Total']
+                                       // len(sample_api_response['Letters']))
+        assert client.total_pages != sample_api_response['Page']
     
     def test_fetch_page_failure(self, client, mock_response):
         """Test failed page fetch"""
