@@ -645,6 +645,9 @@ class CodalClient:
         Args:
             page: 1-based page number to fetch (None = the page currently set)
             use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
+            expected: How many items this page should hold, when known
+            query: The query URL this page belongs to (harvest provenance)
 
         Returns:
             The parsed response dict (with its `Total`, `Page` and `Letters`),
@@ -655,7 +658,10 @@ class CodalClient:
         self.set_page_number(page)
         url = self.get_query_url(use_api=True)
         logger.info(f"Fetching page {self.params['PageNumber']}")
-        response = self._make_request(url, use_cache=use_cache)
+        response = self._make_request(
+            url, use_cache=use_cache, refresh=refresh,
+            expected=expected, query=query
+        )
         if not response:
             return None
 
@@ -685,6 +691,7 @@ class CodalClient:
         Args:
             page: 1-based page number to fetch (None = the page currently set)
             use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
 
         Returns:
             List of letters/announcements or None if failed
@@ -692,7 +699,9 @@ class CodalClient:
         Raises:
             ValidationError: if `page` is not a positive integer.
         """
-        response = self._fetch_page_response(page, use_cache=use_cache)
+        response = self._fetch_page_response(
+            page, use_cache=use_cache, refresh=refresh
+        )
         if not response:
             return None
         return response.get("Letters") or []
@@ -737,7 +746,15 @@ class CodalClient:
                 `allow_partial` is False.
         """
         start_time = time.time()
-        first_response = self._fetch_page_response(1, use_cache=use_cache)
+        # Fixed identity for the crawl's harvest provenance: the query URL as
+        # of page 1. Every page entry is cached tied to the same query string
+        # no matter which PageNumber was current when that page was fetched, so
+        # a later incomplete-harvest record refuses the whole crawl's pages.
+        self.set_page_number(1)
+        query = self.get_query_url()
+        first_response = self._fetch_page_response(
+            1, use_cache=use_cache, refresh=refresh, query=query
+        )
         if not first_response:
             logger.warning("Failed to fetch first page")
             return []
@@ -792,7 +809,14 @@ class CodalClient:
             elif not page_size:
                 break  # no `Total` and an empty first page: nothing to page
             collected.pages_requested += 1
-            response = self._fetch_page_response(page, use_cache=use_cache)
+            expected = (
+                min(page_size, total - (page - 1) * page_size)
+                if total is not None else None
+            )
+            response = self._fetch_page_response(
+                page, use_cache=use_cache, refresh=refresh,
+                expected=expected, query=query
+            )
             if not response:
                 failed_pages += 1
                 logger.warning(f"Failed to fetch page {page}")
@@ -817,7 +841,6 @@ class CodalClient:
             f"Fetched {len(collected)} item(s) from {collected.pages_fetched} "
             f"page(s) in {elapsed:.2f}s"
         )
-        query = self.get_query_url()
         try:
             result = finalize_harvest(
                 collected, allow_partial=allow_partial, query=query

@@ -168,6 +168,66 @@ class FileCache:
                 owned.append(path)
         return owned
 
+    def _enforce_size_budget(self) -> int:
+        """
+        Evict owned entries, oldest first, until the cache directory fits
+        `max_size_mb`. Returns the number of entries removed.
+
+        The budget is measured over the whole directory (the same figure
+        `get_stats()['size_mb']` reports), but only entries this cache wrote
+        are ever removed: unowned files are never touched. If unowned files
+        alone exceed the budget the owned entries are exhausted without
+        getting back under it -- that is the best the cache can do, and it
+        stops rather than looping. Harvest-provenance records are exempt:
+        they are tiny, and deleting one would silently re-admit the pages it
+        refuses. A budget of 0 disables enforcement.
+        """
+        if not self.config.enabled:
+            return 0
+        budget = int(self.config.max_size_mb) * 1024 * 1024
+        if budget <= 0:
+            return 0
+
+        files = list(self.cache_dir.glob("*.json"))
+        sizes = {}
+        for path in files:
+            try:
+                sizes[path] = path.stat().st_size
+            except OSError:
+                continue
+        total = sum(sizes.values())
+        if total <= budget:
+            return 0
+
+        # Over budget: only now pay for the content read that establishes
+        # which files are this cache's own.
+        candidates = []
+        for path in self._owned_cache_files():
+            if path not in sizes:
+                continue
+            record = self._read_record(path)
+            if record is None or record.get('kind') == 'harvest':
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            candidates.append((stat.st_mtime, stat.st_size, path))
+        candidates.sort(key=lambda item: (item[0], item[2]))
+
+        removed = 0
+        for _, size, path in candidates:
+            if total <= budget:
+                break
+            if self._delete_cache_file(path):
+                total -= size
+                removed += 1
+                logger.info(
+                    f"Cache over max_size_mb={self.config.max_size_mb}: "
+                    f"evicted {path.name} ({size} bytes)"
+                )
+        return removed
+
     def _validate(self, record: Dict[str, Any]) -> Optional[str]:
         """
         Decide whether a stored record may be served.
@@ -473,6 +533,10 @@ class FileCache:
                 f"Cached {url} (status={status} total={total} "
                 f"letters={letters} complete={complete})"
             )
+            try:
+                self._enforce_size_budget()
+            except Exception as e:  # size enforcement must never break a write
+                logger.warning(f"Cache size enforcement failed: {e}")
             return True
         except (IOError, TypeError) as e:
             logger.warning(f"Cache write error: {e}")
@@ -614,13 +678,14 @@ class FileCache:
         }
     
     def reset_stats(self) -> None:
-        """Reset cache statistics"""
+        """Reset cache statistics, including the per-reason refusal counts."""
         self._stats = {
             'hits': 0,
             'misses': 0,
             'writes': 0,
             'errors': 0
         }
+        self._refusals = {}
     
     def is_cached(self, url: str, params: Optional[Dict] = None) -> bool:
         """
@@ -729,6 +794,13 @@ class MemoryCache:
         ttl: Optional[int] = None
     ) -> None:
         """Set cached value"""
+        # Same ttl semantics as FileCache.set: None uses the configured
+        # default, 0 writes an entry that expires immediately (never served),
+        # and a negative value stores nothing at all.
+        if ttl is not None and ttl < 0:
+            return
+        ttl = self.default_ttl if ttl is None else ttl
+
         # Evict oldest entries if at capacity
         if len(self._cache) >= self.max_entries:
             oldest_key = min(
@@ -738,7 +810,6 @@ class MemoryCache:
             del self._cache[oldest_key]
         
         key = self._get_key(url, params)
-        ttl = ttl or self.default_ttl
         
         self._cache[key] = {
             'data': data,

@@ -11,7 +11,7 @@ import pytest
 
 from codal_scraper import CodalClient
 from codal_scraper.cache import (
-    CACHE_OWNER, CACHE_RECORD_VERSION, CacheConfig, FileCache,
+    CACHE_OWNER, CACHE_RECORD_VERSION, CacheConfig, FileCache, MemoryCache,
 )
 
 
@@ -68,15 +68,28 @@ def test_client_refetches_after_a_refused_entry(tmp_path, mock_session, mock_res
     mock_session.get.return_value = mock_response(json_data=sample_api_response)
     assert client.fetch_page(1) is not None
 
-    # Corrupt the cached payload's Letters array.
+    # The page entry is the only record in the fresh cache dir (a single-page
+    # fetch writes no harvest record). The real cache key folds `self.params`
+    # in, so the old URL-only lookup landed on a key that does not exist.
     cache = client.cache
-    path = cache._get_cache_path(cache._get_cache_key(client.get_query_url(use_api=True)))
+    paths = list(cache.cache_dir.glob("*.json"))
+    assert len(paths) == 1
+    path = paths[0]
     record = json.loads(path.read_text(encoding="utf-8"))
-    record["data"]["Letters"] = record["data"]["Letters"][:1]
+    original = record["data"]["Letters"]
+    assert original == sample_api_response["Letters"]
+
+    # Seed a mismatch: the payload on disk no longer holds what was recorded --
+    # exactly the "truncated Letters array frozen for an hour" failure mode.
+    record["data"]["Letters"] = original[:1]
     path.write_text(json.dumps(record), encoding="utf-8")
 
+    # The seeded entry is refused...
+    assert cache.get(client.get_query_url(use_api=True), client.params) is None
+    # ...so the client refetches, and the replacement serves the new payload.
     fresh = client.fetch_page(1)
     assert len(fresh) == len(sample_api_response["Letters"])  # refetched, not served
+    assert json.loads(path.read_text(encoding="utf-8"))["data"]["Letters"] == original
 
 
 # ---------- 2. a valid entry is still served ----------
@@ -123,8 +136,6 @@ def test_incomplete_harvest_record_refuses_its_pages(tmp_path):
 
 def test_client_records_incomplete_harvest_provenance(tmp_path, mock_session, mock_response):
     """A harvest that falls short is recorded, so its pages are not reused."""
-    from codal_scraper.exceptions import IncompleteResultsError
-
     def respond(url, **kwargs):
         return mock_response(json_data={"Total": 100, "Letters": [{"Title": "a"}]})
 
@@ -134,11 +145,49 @@ def test_client_records_incomplete_harvest_provenance(tmp_path, mock_session, mo
     client.set_letter_code("ن-45")
     client.set_date_range("1402/01/01", "1402/12/29")
 
-    with pytest.raises(IncompleteResultsError):
-        client.fetch_all_pages(max_pages=1, show_progress=False, allow_partial=False)
+    # max_pages=1 against Total=100 refuses the crawl unless it is allowed to
+    # be partial; the shortfall is then recorded rather than raised.
+    result = client.fetch_all_pages(max_pages=1, show_progress=False, allow_partial=True)
+    assert len(result) == 1
 
     provenance = client.cache.harvest_provenance(client.get_query_url())
     assert provenance is not None and provenance["complete"] is False
+    assert provenance["expected_total"] == 100
+    assert provenance["arrived"] == 1
+
+    # The page cached during that incomplete harvest is refused afterwards:
+    # a later run refetches it instead of serving a partial crawl as complete.
+    page_url = client.get_query_url(use_api=True)
+    assert client.cache.is_cached(page_url, client.params) is False
+    fresh = client.fetch_page(1)
+    assert len(fresh) == 1
+    assert client.cache.get_stats()["refusals"].get("incomplete_harvest") == 1
+
+
+def test_incomplete_harvest_recorded_before_the_error_propagates(tmp_path, mock_session, mock_response):
+    """Even when the shortfall raises, the provenance is recorded first."""
+    from codal_scraper.exceptions import IncompleteResultsError
+
+    def respond(url, **kwargs):
+        # Page 1 carries the API's Total; page 2 comes back empty, so the
+        # harvest falls short of Total and raises.
+        if "PageNumber=2" in url:
+            return mock_response(json_data={"Total": 100, "Letters": []})
+        return mock_response(json_data={"Total": 100, "Letters": [{"Title": "a"}]})
+
+    client = CodalClient(cache_config=CacheConfig(cache_dir=str(tmp_path / "c"), cleanup_on_init=False))
+    client._session = mock_session
+    mock_session.get.side_effect = respond
+    client.set_letter_code("ن-45")
+    client.set_date_range("1402/01/01", "1402/12/29")
+    query = client.get_query_url()  # PageNumber defaults to 1: the crawl's identity
+
+    with pytest.raises(IncompleteResultsError):
+        client.fetch_all_pages(show_progress=False)
+
+    provenance = client.cache.harvest_provenance(query)
+    assert provenance is not None and provenance["complete"] is False
+    assert provenance["expected_total"] == 100 and provenance["arrived"] == 1
 
 
 # ---------- 4. ttl=0 means "expire now" ----------
@@ -296,3 +345,62 @@ def test_concurrent_writers_never_corrupt_an_entry(tmp_path):
     assert cache.get(url) in payloads
     # No temp files left behind by the atomic write.
     assert list(cache.cache_dir.glob("*.tmp")) == []
+
+
+# ---------- 8. stats reset, MemoryCache ttl semantics, size budget ----------
+
+def test_reset_stats_clears_refusal_counters(tmp_path):
+    cache = make_cache(tmp_path)
+    url = "https://example.com/api?x=1"
+    cache.set(url, payload(3), status=200, expected=3)
+    path = cache._get_cache_path(cache._get_cache_key(url))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["data"]["Letters"] = record["data"]["Letters"][:1]
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert cache.get(url) is None
+    assert cache.get_stats()["refusals"].get("letters_mismatch") == 1
+    cache.reset_stats()
+    assert cache.get_stats()["refusals"] == {}
+
+
+def test_memory_cache_ttl_semantics_match_file_cache():
+    cache = MemoryCache(default_ttl=300)
+    url = "https://example.com/mem"
+    cache.set(url, {"n": 1}, ttl=0)
+    assert cache.get(url) is None            # written already-expired: never served
+    cache.set(url, {"n": 2}, ttl=-1)
+    assert cache.get(url) is None            # negative ttl: nothing stored at all
+    assert cache.get_stats()["entries"] == 0
+    cache.set(url, {"n": 3})                 # None: the configured default
+    assert cache.get(url) == {"n": 3}
+
+
+def test_max_size_mb_evicts_oldest_owned_entries_first(tmp_path):
+    cache = make_cache(tmp_path, max_size_mb=1)
+    big = {"Total": 1, "Letters": [{"Title": "x" * 40000}]}  # ~40 KB per entry
+    urls = [f"https://example.com/big{i}" for i in range(30)]
+    for u in urls:
+        cache.set(u, big, status=200)
+
+    stats = cache.get_stats()
+    assert stats["entries"] < 30             # evicted back under the budget
+    assert stats["size_mb"] < 1.0
+    assert cache.get(urls[0]) is None        # oldest evicted first
+    assert cache.get(urls[-1]) is not None   # newest survives
+
+
+def test_max_size_mb_never_touches_unowned_files(tmp_path):
+    cache = make_cache(tmp_path, max_size_mb=1)
+    decoy = cache.cache_dir / "exported_results.json"
+    decoy.write_text("y" * (900 * 1024), encoding="utf-8")  # 900 KB not the cache's
+
+    big = {"Total": 1, "Letters": [{"Title": "x" * 40000}]}
+    for i in range(6):
+        cache.set(f"https://example.com/big{i}", big, status=200)
+
+    assert decoy.exists()
+    assert decoy.read_text(encoding="utf-8") == "y" * (900 * 1024)
+    # The owned entries were evicted so the directory itself fits the budget.
+    assert cache.get_stats()["size_mb"] < 1.0
+    assert cache.get(f"https://example.com/big5") is not None
