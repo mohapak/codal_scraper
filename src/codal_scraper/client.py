@@ -31,7 +31,8 @@ from .cache import FileCache, CacheConfig
 from .rate_limiter import RateLimiter, RateLimitConfig
 from .types import QueryParams, LetterData, QueryStats, PaginationInfo
 from .pagination import (
-    MAX_PAGES_ABSOLUTE, PaginationCapExceededError, assert_within_cap,
+    MAX_PAGES_ABSOLUTE, IncompleteResultsError, PaginationCapExceededError,
+    assert_within_cap,
     detect_page_semantics,
     estimate_page_count, finalize_harvest, new_result, page_cap, response_total
 )
@@ -510,27 +511,37 @@ class CodalClient:
     # ============== Data Fetching ==============
     
     def _make_request(
-        self, 
-        url: str, 
-        use_cache: bool = True
+        self,
+        url: str,
+        use_cache: bool = True,
+        refresh: bool = False,
+        expected: Optional[int] = None,
+        query: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Make HTTP request with retry logic, caching, and rate limiting.
-        
+
         Args:
             url: URL to request
             use_cache: Whether to use cache
-        
+            refresh: Ignore any cached entry and fetch, replacing it. This is
+                the operator's escape hatch after a code fix, so re-running a
+                pipeline cannot silently reuse a pre-fix response.
+            expected: How many items this page should hold, when known (the
+                page size, or `Total` minus what earlier pages held). A response
+                holding fewer is cached marked incomplete and is never served
+                as complete.
+            query: The query URL this page belongs to, used to tie the entry to
+                the harvest provenance recorded for that query.
         Returns:
             Response data as dictionary or None if failed
-            
         Raises:
             RateLimitError: If rate limit exceeded and retries exhausted
             APIError: If API returns an error
             NetworkError: If network connection fails
         """
         # Check cache first
-        if use_cache and self.cache:
+        if use_cache and self.cache and not refresh:
             cached = self.cache.get(url, self.params)
             if cached is not None:
                 self._stats['cache_hits'] += 1
@@ -572,9 +583,15 @@ class CodalClient:
                             content_type=content_type
                         )
                 
-                # Cache successful response
+                # Cache the response together with the metadata a later read
+                # needs in order to decide whether it may be served at all.
                 if use_cache and self.cache and data:
-                    self.cache.set(url, data, self.params)
+                    self.cache.set(
+                        url, data, self.params,
+                        status=response.status_code,
+                        expected=expected,
+                        query=query
+                    )
                 
                 return data
                 
@@ -617,7 +634,10 @@ class CodalClient:
     def _fetch_page_response(
         self,
         page: Optional[int] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        refresh: bool = False,
+        expected: Optional[int] = None,
+        query: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Fetch one raw API response page and refresh pagination metadata.
@@ -625,6 +645,9 @@ class CodalClient:
         Args:
             page: 1-based page number to fetch (None = the page currently set)
             use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
+            expected: How many items this page should hold, when known
+            query: The query URL this page belongs to (harvest provenance)
 
         Returns:
             The parsed response dict (with its `Total`, `Page` and `Letters`),
@@ -635,7 +658,10 @@ class CodalClient:
         self.set_page_number(page)
         url = self.get_query_url(use_api=True)
         logger.info(f"Fetching page {self.params['PageNumber']}")
-        response = self._make_request(url, use_cache=use_cache)
+        response = self._make_request(
+            url, use_cache=use_cache, refresh=refresh,
+            expected=expected, query=query
+        )
         if not response:
             return None
 
@@ -656,7 +682,8 @@ class CodalClient:
     def fetch_page(
         self,
         page: Optional[int] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> Optional[List[LetterData]]:
         """
         Fetch a single page of results.
@@ -664,6 +691,7 @@ class CodalClient:
         Args:
             page: 1-based page number to fetch (None = the page currently set)
             use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
 
         Returns:
             List of letters/announcements or None if failed
@@ -671,7 +699,9 @@ class CodalClient:
         Raises:
             ValidationError: if `page` is not a positive integer.
         """
-        response = self._fetch_page_response(page, use_cache=use_cache)
+        response = self._fetch_page_response(
+            page, use_cache=use_cache, refresh=refresh
+        )
         if not response:
             return None
         return response.get("Letters") or []
@@ -681,7 +711,8 @@ class CodalClient:
         max_pages: Optional[int] = None,
         use_cache: bool = True,
         show_progress: bool = True,
-        allow_partial: bool = False
+        allow_partial: bool = False,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Fetch every page of the current query, whichever way the API's `Page`
@@ -715,7 +746,15 @@ class CodalClient:
                 `allow_partial` is False.
         """
         start_time = time.time()
-        first_response = self._fetch_page_response(1, use_cache=use_cache)
+        # Fixed identity for the crawl's harvest provenance: the query URL as
+        # of page 1. Every page entry is cached tied to the same query string
+        # no matter which PageNumber was current when that page was fetched, so
+        # a later incomplete-harvest record refuses the whole crawl's pages.
+        self.set_page_number(1)
+        query = self.get_query_url()
+        first_response = self._fetch_page_response(
+            1, use_cache=use_cache, refresh=refresh, query=query
+        )
         if not first_response:
             logger.warning("Failed to fetch first page")
             return []
@@ -770,7 +809,14 @@ class CodalClient:
             elif not page_size:
                 break  # no `Total` and an empty first page: nothing to page
             collected.pages_requested += 1
-            response = self._fetch_page_response(page, use_cache=use_cache)
+            expected = (
+                min(page_size, total - (page - 1) * page_size)
+                if total is not None else None
+            )
+            response = self._fetch_page_response(
+                page, use_cache=use_cache, refresh=refresh,
+                expected=expected, query=query
+            )
             if not response:
                 failed_pages += 1
                 logger.warning(f"Failed to fetch page {page}")
@@ -795,9 +841,27 @@ class CodalClient:
             f"Fetched {len(collected)} item(s) from {collected.pages_fetched} "
             f"page(s) in {elapsed:.2f}s"
         )
-        return finalize_harvest(
-            collected, allow_partial=allow_partial, query=self.get_query_url()
-        )
+        try:
+            result = finalize_harvest(
+                collected, allow_partial=allow_partial, query=query
+            )
+        except IncompleteResultsError:
+            # Record the shortfall before it propagates: the pages cached while
+            # harvesting it are refused next time rather than served as if the
+            # harvest had been complete.
+            self._record_harvest(collected, query)
+            raise
+        self._record_harvest(result, query)
+        return result
+
+    def _record_harvest(self, result: Any, query: str) -> None:
+        """Record what a harvest of `query` actually collected."""
+        if self.cache is None:
+            return
+        try:
+            self.cache.record_harvest(query, result.provenance())
+        except Exception as e:  # the cache must never break a fetch
+            logger.warning(f"Could not record harvest provenance: {e}")
 
     def fetch_tsetmc_data(
         self, 
@@ -826,7 +890,9 @@ class CodalClient:
         from_date: str, 
         to_date: str,
         company_type: Optional[str] = None,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Search for board of directors changes (letter code ن-45).
@@ -852,7 +918,9 @@ class CodalClient:
         
         self.set_entity_type(include_childs=False, include_mains=True)
         
-        return self.fetch_all_pages(max_pages=max_pages)
+        return self.fetch_all_pages(
+            max_pages=max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     def search_financial_statements(
         self,
@@ -860,7 +928,9 @@ class CodalClient:
         to_date: str,
         period_length: int = 12,
         audited_only: bool = True,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Search for financial statements.
@@ -883,14 +953,18 @@ class CodalClient:
         if audited_only:
             self.set_audit_status(audited=True, not_audited=False)
         
-        return self.fetch_all_pages(max_pages=max_pages)
+        return self.fetch_all_pages(
+            max_pages=max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     def search_monthly_reports(
         self,
         from_date: str,
         to_date: str,
         symbol: Optional[str] = None,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Search for monthly activity reports (letter code ن-30).
@@ -911,14 +985,18 @@ class CodalClient:
         if symbol:
             self.set_symbol(symbol)
         
-        return self.fetch_all_pages(max_pages=max_pages)
+        return self.fetch_all_pages(
+            max_pages=max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     def search_by_symbol(
         self, 
         symbol: str, 
         from_date: Optional[str] = None, 
         to_date: Optional[str] = None,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Search all announcements for a specific symbol.
@@ -938,7 +1016,9 @@ class CodalClient:
         if from_date and to_date:
             self.set_date_range(from_date, to_date)
         
-        return self.fetch_all_pages(max_pages=max_pages)
+        return self.fetch_all_pages(
+            max_pages=max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     def get_summary_stats(self) -> Dict[str, Any]:
         """
@@ -1236,7 +1316,7 @@ class CodalClient:
             Number of cache entries cleared
         """
         if self.cache:
-            return self.cache.invalidate()
+            return self.cache.invalidate(bulk=True)
         return 0
     
     def reset_stats(self) -> None:
