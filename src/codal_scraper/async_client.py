@@ -20,7 +20,9 @@ from .constants import (
 )
 from .utils import clean_dict, clean_symbol
 from .validators import InputValidator
-from .exceptions import APIError, RateLimitError, NetworkError
+from .exceptions import (
+    APIError, RateLimitError, NetworkError, IncompleteResultsError,
+)
 from .cache import FileCache, CacheConfig
 from .rate_limiter import AsyncRateLimiter
 from .types import LetterData, QueryParams, QueryStats
@@ -155,22 +157,40 @@ class AsyncCodalClient:
         return f"{SEARCH_API_URL}{query}&search=true"
     
     async def _fetch_page(
-        self, 
-        url: str, 
-        use_cache: bool = True
+        self,
+        url: str,
+        use_cache: bool = True,
+        refresh: bool = False,
+        expected: Optional[int] = None,
+        query: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Fetch a single page with rate limiting and retries.
-        
+
+        Cache reads go through `FileCache.get`, which validates every record
+        and refuses an inconsistent, partial or stale one (returning None, so
+        the caller refetches). Cache writes record the same metadata the
+        synchronous client records -- HTTP status, `Total`, the `Letters`
+        count, `expected` when the caller knows it, and the crawl's `query`
+        identity -- so a later read can refuse an entry the numbers no longer
+        vouch for. `refresh=True` skips the read entirely and overwrites the
+        entry, mirroring `CodalClient._make_request`.
+
         Args:
             url: URL to fetch
             use_cache: Whether to use cache
-            
+            refresh: Ignore any cached entry and fetch, replacing it
+            expected: How many items this page should hold, when known; a
+                payload holding fewer is cached marked incomplete and never
+                served
+            query: The query URL this page belongs to (harvest provenance)
+
         Returns:
             Response data or None if failed
         """
-        # Check cache first
-        if use_cache and self.cache:
+        # Check cache first: get() itself refuses anything it cannot vouch for,
+        # so a None here (miss *or* refusal) means "fetch it".
+        if use_cache and self.cache and not refresh:
             cached = self.cache.get(url)
             if cached is not None:
                 self._stats['cache_hits'] += 1
@@ -195,11 +215,22 @@ class AsyncCodalClient:
                         
                         response.raise_for_status()
                         data = await response.json()
-                        
-                        # Cache successful response
+
+                        # Cache successful response, recording what makes the
+                        # payload trustworthy: the HTTP status, the page's
+                        # expected size when known, and the crawl identity.
+                        # `set()` derives `Total` and the `Letters` count from
+                        # the payload itself and refuses to treat a short
+                        # payload as complete (cached marked incomplete, then
+                        # refused on read).
                         if use_cache and self.cache and data:
-                            self.cache.set(url, data)
-                        
+                            self.cache.set(
+                                url, data,
+                                status=response.status,
+                                expected=expected,
+                                query=query
+                            )
+
                         return data
                         
                 except aiohttp.ClientResponseError as e:
@@ -225,7 +256,8 @@ class AsyncCodalClient:
         params: Dict,
         max_pages: Optional[int] = None,
         use_cache: bool = True,
-        allow_partial: bool = False
+        allow_partial: bool = False,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Fetch every page of a query, whichever way the API's `Page` field
@@ -234,7 +266,11 @@ class AsyncCodalClient:
         Behaviourally identical to `CodalClient.fetch_all_pages`: the page count
         comes from `Total` and the page size actually returned, never from the
         response's `Page` field (P0-3); paging stops at `Total` items or at the
-        first empty page; and the harvest is asserted against `Total`.
+        first empty page; and the harvest is asserted against `Total`. Every
+        page entry is cached tied to the same crawl identity (the query URL as
+        of page 1) and carries the page's expected size, and the harvest
+        provenance is recorded under that identity, so the pages of an
+        incomplete crawl are refused the next time around (P1-1, sync parity).
 
         Args:
             params: Query parameters
@@ -243,6 +279,9 @@ class AsyncCodalClient:
             allow_partial: Return what arrived when it falls short of `Total`,
                 instead of raising. The returned list still records
                 `expected_total`, `arrived`, `shortfall` and `provenance()`.
+            refresh: Ignore any cached entry and fetch every page, replacing
+                what the cache holds. The operator's escape hatch after a code
+                fix, so a re-run cannot silently reuse a pre-fix response.
 
         Returns:
             Combined list of all letters/announcements, as a
@@ -255,8 +294,15 @@ class AsyncCodalClient:
                 `allow_partial` is False.
         """
         start_time = time.time()
-        first_url = self._build_url(params, page=1)
-        first_response = await self._fetch_page(first_url, use_cache)
+        # Fixed identity for the crawl's harvest provenance: the query URL as
+        # of page 1. Every page entry is cached tied to the same query string
+        # no matter which PageNumber it was fetched under, so a later
+        # incomplete-harvest record refuses the whole crawl's pages.
+        query = self._build_url(params, page=1)
+        first_url = query
+        first_response = await self._fetch_page(
+            first_url, use_cache=use_cache, refresh=refresh, query=query
+        )
         if not first_response:
             logger.warning("Failed to fetch first page")
             return []
@@ -303,8 +349,14 @@ class AsyncCodalClient:
         failed_pages = 0
 
         async def fetch(page_number: int) -> Optional[Dict[str, Any]]:
+            expected = (
+                min(page_size, total - (page_number - 1) * page_size)
+                if total is not None else None
+            )
             return await self._fetch_page(
-                self._build_url(params, page=page_number), use_cache
+                self._build_url(params, page=page_number),
+                use_cache=use_cache, refresh=refresh,
+                expected=expected, query=query
             )
 
         # Pages 2..estimate are fetched concurrently; the client's semaphore and
@@ -360,7 +412,27 @@ class AsyncCodalClient:
             f"Fetched {len(collected)} item(s) from {collected.pages_fetched} "
             f"page(s) in {elapsed:.2f}s"
         )
-        return finalize_harvest(collected, allow_partial=allow_partial)
+        try:
+            result = finalize_harvest(
+                collected, allow_partial=allow_partial, query=query
+            )
+        except IncompleteResultsError:
+            # Record the shortfall before it propagates: the pages cached while
+            # harvesting it are refused next time rather than served as if the
+            # harvest had been complete.
+            self._record_harvest(collected, query)
+            raise
+        self._record_harvest(result, query)
+        return result
+
+    def _record_harvest(self, result: Any, query: str) -> None:
+        """Record what a harvest of `query` actually collected."""
+        if self.cache is None:
+            return
+        try:
+            self.cache.record_harvest(query, result.provenance())
+        except Exception as e:  # the cache must never break a fetch
+            logger.warning(f"Could not record harvest provenance: {e}")
 
     # ============== Convenience Methods ==============
     
@@ -369,7 +441,9 @@ class AsyncCodalClient:
         from_date: str,
         to_date: str,
         company_type: Optional[str] = None,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Fetch board of directors changes (ن-45).
@@ -379,7 +453,9 @@ class AsyncCodalClient:
             to_date: End date (Persian calendar)
             company_type: Optional company type filter
             max_pages: Maximum pages to fetch
-            
+            use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
+
         Returns:
             List of board change announcements
         """
@@ -399,7 +475,9 @@ class AsyncCodalClient:
         if company_type:
             params["CompanyType"] = COMPANY_TYPES.get(company_type, company_type)
         
-        return await self.fetch_all_pages(params, max_pages)
+        return await self.fetch_all_pages(
+            params, max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     async def fetch_financial_statements(
         self,
@@ -407,7 +485,9 @@ class AsyncCodalClient:
         to_date: str,
         period_length: int = 12,
         audited_only: bool = True,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Fetch financial statements (ن-10).
@@ -418,7 +498,9 @@ class AsyncCodalClient:
             period_length: Period length in months
             audited_only: Only fetch audited statements
             max_pages: Maximum pages to fetch
-            
+            use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
+
         Returns:
             List of financial statement announcements
         """
@@ -436,14 +518,18 @@ class AsyncCodalClient:
             params["Audited"] = "true"
             params["NotAudited"] = "false"
         
-        return await self.fetch_all_pages(params, max_pages)
+        return await self.fetch_all_pages(
+            params, max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     async def fetch_monthly_reports(
         self,
         from_date: str,
         to_date: str,
         symbol: Optional[str] = None,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Fetch monthly activity reports (ن-30).
@@ -453,7 +539,9 @@ class AsyncCodalClient:
             to_date: End date (Persian calendar)
             symbol: Optional specific symbol
             max_pages: Maximum pages to fetch
-            
+            use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
+
         Returns:
             List of monthly report announcements
         """
@@ -469,14 +557,18 @@ class AsyncCodalClient:
         if symbol:
             params["Symbol"] = clean_symbol(symbol)
         
-        return await self.fetch_all_pages(params, max_pages)
+        return await self.fetch_all_pages(
+            params, max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     async def fetch_by_symbol(
         self,
         symbol: str,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
-        max_pages: Optional[int] = None
+        max_pages: Optional[int] = None,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> List[LetterData]:
         """
         Fetch all announcements for a specific symbol.
@@ -505,14 +597,18 @@ class AsyncCodalClient:
             InputValidator(to_date).is_date()
             params["ToDate"] = to_date
         
-        return await self.fetch_all_pages(params, max_pages)
+        return await self.fetch_all_pages(
+            params, max_pages, use_cache=use_cache, refresh=refresh
+        )
     
     async def fetch_multiple_symbols(
         self,
         symbols: List[str],
         from_date: str,
         to_date: str,
-        max_pages_per_symbol: int = 10
+        max_pages_per_symbol: int = 10,
+        use_cache: bool = True,
+        refresh: bool = False
     ) -> Dict[str, List[LetterData]]:
         """
         Fetch announcements for multiple symbols concurrently.
@@ -522,13 +618,16 @@ class AsyncCodalClient:
             from_date: Start date (Persian calendar)
             to_date: End date (Persian calendar)
             max_pages_per_symbol: Max pages per symbol
-            
+            use_cache: Whether to use cache
+            refresh: Ignore any cached entry and fetch, replacing it
+
         Returns:
             Dictionary mapping symbol to list of announcements
         """
         async def fetch_symbol(symbol: str) -> tuple:
             letters = await self.fetch_by_symbol(
-                symbol, from_date, to_date, max_pages_per_symbol
+                symbol, from_date, to_date, max_pages_per_symbol,
+                use_cache=use_cache, refresh=refresh
             )
             return symbol, letters
         
